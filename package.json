@@ -1,0 +1,29 @@
+{
+  "name": "copilot-remote",
+  "version": "0.1.0",
+  "description": "Monitor, interact with, and control your Copilot CLI agent from WeChat",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "copilot-remote": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "strip-ansi": "^7.1.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  },
+  "license": "MIT"
+}
