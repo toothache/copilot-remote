@@ -5,12 +5,12 @@
  * escape sequences (cursor movement, erase, scroll, alternate screen, etc.)
  * into clean, human-readable text.
  *
- * Provides two views:
- *   - getLines(): log of meaningful viewport snapshots + scrollback lines
+ * Provides:
  *   - getViewport(): current visible screen content (for pattern matching)
+ *   - getViewportText(): viewport as single string
+ *   - getLines(): scrollback lines for non-TUI apps (normal terminal mode)
  *
- * For TUI apps that use the alternate screen buffer (like Copilot CLI),
- * scrollback is empty — so we also capture viewport diffs into the log.
+ * For TUI apps (alternate screen), use ContentLog for semantic logging instead.
  */
 
 // @xterm/headless is CJS — Terminal is on the default export
@@ -22,7 +22,7 @@ import { RingBuffer } from './ring-buffer.js';
 export interface ScreenBufferOptions {
   cols?: number;
   rows?: number;
-  /** Max lines to keep in the log ring buffer (default 1000) */
+  /** Max lines to keep in the scrollback log (default 1000) */
   scrollbackCapacity?: number;
 }
 
@@ -31,8 +31,6 @@ export class ScreenBuffer {
   private log: RingBuffer;
   /** Number of scrollback lines we've already consumed into the log */
   private lastScrollbackDrain = 0;
-  /** Last viewport snapshot text — for diffing */
-  private lastViewportSnapshot = '';
 
   constructor(opts: ScreenBufferOptions = {}) {
     const cols = opts.cols ?? 80;
@@ -50,12 +48,11 @@ export class ScreenBuffer {
 
   /**
    * Feed raw PTY output data into the virtual terminal.
-   * The callback-based drain ensures data is processed before reads.
    */
   write(data: string): Promise<void> {
     return new Promise((resolve) => {
       this.terminal.write(data, () => {
-        this.drain();
+        this.drainScrollback();
         resolve();
       });
     });
@@ -63,35 +60,31 @@ export class ScreenBuffer {
 
   /**
    * Wait for all pending writes to be processed.
-   * Call this before reading if you've been feeding data in a loop.
    */
   flush(): Promise<void> {
     return new Promise((resolve) => {
       this.terminal.write('', () => {
-        this.drain();
+        this.drainScrollback();
         resolve();
       });
     });
   }
 
   /**
-   * Get recent log lines — clean text resolved through the virtual terminal.
-   * Includes both scrollback (for normal-mode apps) and viewport snapshots
-   * (for alternate-screen TUI apps like Copilot CLI).
-   * Returns the last N lines (default: all available).
+   * Get scrollback log lines (for non-TUI apps that produce scrollback).
+   * For TUI apps using alternate screen, scrollback is empty — use ContentLog.
    */
   getLines(n?: number): string[] {
-    this.drain();
+    this.drainScrollback();
     return this.log.getLines(n);
   }
 
   /**
    * Get the current viewport content — what a user would see on screen right now.
-   * Used for pattern matching (permission prompts, errors, etc.)
    * Returns an array of `rows` lines (some may be empty).
    */
   getViewport(): string[] {
-    this.drain();
+    this.drainScrollback();
     const buf = this.terminal.buffer.active;
     const rows = this.terminal.rows;
     const lines: string[] = [];
@@ -110,13 +103,13 @@ export class ScreenBuffer {
     return this.getViewport().join('\n');
   }
 
-  /** Total log lines available */
+  /** Total scrollback log lines available */
   get size(): number {
-    this.drain();
+    this.drainScrollback();
     return this.log.size;
   }
 
-  /** Resize the virtual terminal (call when real terminal resizes) */
+  /** Resize the virtual terminal */
   resize(cols: number, rows: number): void {
     this.terminal.resize(cols, rows);
   }
@@ -126,23 +119,11 @@ export class ScreenBuffer {
     this.terminal.reset();
     this.log.clear();
     this.lastScrollbackDrain = 0;
-    this.lastViewportSnapshot = '';
   }
 
   /** Dispose the underlying xterm terminal */
   dispose(): void {
     this.terminal.dispose();
-  }
-
-  /**
-   * Drain new content into the log ring buffer.
-   * Two sources:
-   *   1. Scrollback lines (for normal-mode output)
-   *   2. Viewport diffs (for alternate-screen TUI apps)
-   */
-  private drain(): void {
-    this.drainScrollback();
-    this.drainViewportDiff();
   }
 
   /**
@@ -162,31 +143,6 @@ export class ScreenBuffer {
         }
       }
       this.lastScrollbackDrain = scrollbackCount;
-    }
-  }
-
-  /**
-   * Capture viewport changes into the log.
-   * For TUI apps using the alternate screen, scrollback is always empty.
-   * Instead, we diff the viewport and log new non-empty lines.
-   */
-  private drainViewportDiff(): void {
-    const buf = this.terminal.buffer.active;
-    const rows = this.terminal.rows;
-    const lines: string[] = [];
-    for (let i = 0; i < rows; i++) {
-      const line = buf.getLine(buf.baseY + i);
-      lines.push(line ? line.translateToString(true) : '');
-    }
-
-    const snapshot = lines.join('\n');
-    if (snapshot === this.lastViewportSnapshot) return;
-    this.lastViewportSnapshot = snapshot;
-
-    // Extract only the non-empty lines that are new
-    const newLines = lines.filter(l => l.trim().length > 0);
-    for (const line of newLines) {
-      this.log.push(line);
     }
   }
 }

@@ -17,6 +17,7 @@
 
 import { PtySpawn } from '../core/index.js';
 import { MonitorServer } from '../core/monitor-server.js';
+import { copilotProfile } from '../core/agent-profile.js';
 import { createReadStream, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { spawn as cpSpawn } from 'node:child_process';
@@ -90,7 +91,10 @@ async function runLive(command: string, args: string[], name: string, record: bo
     process.exit(1);
   }
 
-  const ptySpawn = new PtySpawn({ command, args, name, record });
+  // Auto-detect agent profile from command name
+  const agentProfile = /copilot/i.test(command) ? copilotProfile : undefined;
+
+  const ptySpawn = new PtySpawn({ command, args, name, record, agentProfile });
 
   let monitorServer: MonitorServer | undefined;
 

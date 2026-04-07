@@ -1,19 +1,37 @@
 /**
  * MonitorServer — lightweight TCP server attached to a PtySpawn instance.
- * Streams ring buffer contents and live output to connected monitor clients.
+ *
+ * Design: pull-based with push notifications for important events.
+ * Clients request data on demand; server only pushes state changes and exit.
  *
  * Protocol: newline-delimited JSON messages.
- *   Server → Client:
- *     { "type": "hello", "name": "...", "command": "...", "pid": N, "bufferSize": N, "port": N }
- *     { "type": "output", "line": "..." }
- *     { "type": "state", "state": "running|exited", "exitCode?": N }
- *     { "type": "ring", "lines": ["..."] }    (sent on connect, initial dump)
- *   Client → Server:
- *     { "type": "get_ring", "n": N }           (request last N lines)
+ *
+ *   Server → Client (push — unsolicited):
+ *     { "type": "hello", "name", "command", "pid", "port", "startedAt" }
+ *     { "type": "push_state", "state": "running|exited", "exitCode?": N }
+ *
+ *   Client → Server (request):
+ *     { "type": "get_viewport" }
+ *     { "type": "get_logs", "n": N }
+ *     { "type": "get_info" }
+ *     { "type": "send_input", "data": "..." }
+ *     { "type": "send_ctrl_c" }
+ *
+ *   Server → Client (response to request):
+ *     { "type": "viewport", "lines": ["..."] }
+ *     { "type": "logs", "lines": ["..."], "total": N }
+ *     { "type": "info", "name", "command", "pid", "state", "port", "startedAt", "logSize" }
+ *     { "type": "ok", "action": "input_sent|ctrl_c_sent" }
  */
 
 import { createServer, type Server, type Socket } from 'node:net';
+import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { PtySpawn } from './pty-spawn.js';
+
+/** Well-known path where the monitor server advertises its port */
+export const MONITOR_INFO_PATH = join(homedir(), '.copilot-remote', 'monitor.json');
 
 export interface MonitorServerOptions {
   ptySpawn: PtySpawn;
@@ -31,8 +49,7 @@ export class MonitorServer {
   private state: 'running' | 'exited' = 'running';
   private exitCode?: number;
   private actualPort = 0;
-  private outputTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastViewportSnapshot = '';
+  private startedAt = Date.now();
 
   constructor(opts: MonitorServerOptions) {
     this.ptySpawn = opts.ptySpawn;
@@ -41,18 +58,10 @@ export class MonitorServer {
 
     this.server = createServer((socket) => this.onConnect(socket));
 
-    // Periodically send viewport snapshots to clients (clean, resolved text)
-    // instead of streaming raw ANSI which contains cursor movement noise
-    this.ptySpawn.on('data', () => {
-      // Debounce: only send after data settles (50ms)
-      if (this.outputTimer) clearTimeout(this.outputTimer);
-      this.outputTimer = setTimeout(() => this.sendViewportUpdate(), 50);
-    });
-
     this.ptySpawn.on('exit', ({ exitCode }: { exitCode: number }) => {
       this.state = 'exited';
       this.exitCode = exitCode;
-      this.broadcast({ type: 'state', state: 'exited', exitCode });
+      this.broadcast({ type: 'push_state', state: 'exited', exitCode });
     });
   }
 
@@ -61,13 +70,14 @@ export class MonitorServer {
       this.server.listen(port, '127.0.0.1', () => {
         const addr = this.server.address();
         this.actualPort = typeof addr === 'object' && addr ? addr.port : 0;
+        this.writeInfoFile();
         resolve(this.actualPort);
       });
     });
   }
 
   stop(): void {
-    if (this.outputTimer) clearTimeout(this.outputTimer);
+    this.removeInfoFile();
     for (const client of this.clients) {
       client.destroy();
     }
@@ -79,41 +89,24 @@ export class MonitorServer {
     return this.actualPort;
   }
 
-  private sendViewportUpdate(): void {
-    const viewport = this.ptySpawn.getViewport();
-    const snapshot = viewport.join('\n');
-    // Only send if viewport actually changed
-    if (snapshot === this.lastViewportSnapshot) return;
-    this.lastViewportSnapshot = snapshot;
-
-    const lines = viewport.filter(l => l.length > 0);
-    if (lines.length > 0) {
-      this.broadcast({ type: 'viewport', lines });
-    }
-  }
-
   private onConnect(socket: Socket): void {
     this.clients.add(socket);
 
-    // Send hello + initial ring buffer dump
+    // Push: hello + current state
     this.send(socket, {
       type: 'hello',
       name: this.name,
       command: this.command,
       pid: this.ptySpawn.pid,
-      bufferSize: this.ptySpawn.getLines().length,
       port: this.actualPort,
+      startedAt: this.startedAt,
     });
 
     this.send(socket, {
-      type: 'state',
+      type: 'push_state',
       state: this.state,
       ...(this.exitCode !== undefined && { exitCode: this.exitCode }),
     });
-
-    // Send recent ring buffer
-    const lines = this.ptySpawn.getLines(50);
-    this.send(socket, { type: 'ring', lines });
 
     // Handle client requests
     let buf = '';
@@ -125,7 +118,7 @@ export class MonitorServer {
         if (!part.trim()) continue;
         try {
           const msg = JSON.parse(part);
-          this.handleClientMessage(socket, msg);
+          this.handleRequest(socket, msg);
         } catch { /* ignore malformed */ }
       }
     });
@@ -134,10 +127,47 @@ export class MonitorServer {
     socket.on('error', () => this.clients.delete(socket));
   }
 
-  private handleClientMessage(socket: Socket, msg: { type: string; n?: number }): void {
-    if (msg.type === 'get_ring') {
-      const lines = this.ptySpawn.getLines(msg.n ?? 50);
-      this.send(socket, { type: 'ring', lines });
+  private handleRequest(socket: Socket, msg: { type: string; n?: number; data?: string }): void {
+    switch (msg.type) {
+      case 'get_viewport': {
+        const lines = this.ptySpawn.getViewport().filter(l => l.trim().length > 0);
+        this.send(socket, { type: 'viewport', lines });
+        break;
+      }
+      case 'get_logs': {
+        const lines = msg.n ? this.ptySpawn.getLines(msg.n) : this.ptySpawn.getLines();
+        const total = this.ptySpawn.getLines().length;
+        this.send(socket, { type: 'logs', lines, total });
+        break;
+      }
+      case 'get_info': {
+        this.send(socket, {
+          type: 'info',
+          name: this.name,
+          command: this.command,
+          pid: this.ptySpawn.pid,
+          state: this.state,
+          port: this.actualPort,
+          startedAt: this.startedAt,
+          logSize: this.ptySpawn.getLines().length,
+          ...(this.exitCode !== undefined && { exitCode: this.exitCode }),
+        });
+        break;
+      }
+      case 'send_input': {
+        if (msg.data && this.state === 'running') {
+          this.ptySpawn.write(msg.data);
+          this.send(socket, { type: 'ok', action: 'input_sent' });
+        }
+        break;
+      }
+      case 'send_ctrl_c': {
+        if (this.state === 'running') {
+          this.ptySpawn.write('\x03');
+          this.send(socket, { type: 'ok', action: 'ctrl_c_sent' });
+        }
+        break;
+      }
     }
   }
 
@@ -156,5 +186,25 @@ export class MonitorServer {
         this.clients.delete(client);
       }
     }
+  }
+
+  private writeInfoFile(): void {
+    try {
+      const dir = join(homedir(), '.copilot-remote');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(MONITOR_INFO_PATH, JSON.stringify({
+        port: this.actualPort,
+        pid: this.ptySpawn.pid,
+        name: this.name,
+        command: this.command,
+        startedAt: this.startedAt,
+      }) + '\n');
+    } catch { /* best effort */ }
+  }
+
+  private removeInfoFile(): void {
+    try {
+      rmSync(MONITOR_INFO_PATH, { force: true });
+    } catch { /* best effort */ }
   }
 }

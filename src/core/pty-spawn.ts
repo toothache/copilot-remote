@@ -9,7 +9,9 @@ import * as pty from 'node-pty';
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import { ScreenBuffer } from './screen-buffer.js';
+import { ContentLog } from './content-log.js';
 import { Recorder } from './recorder.js';
+import type { AgentProfile } from './agent-profile.js';
 
 export interface PtySpawnOptions {
   command: string;
@@ -24,6 +26,8 @@ export interface PtySpawnOptions {
   name?: string;
   /** Ring buffer capacity (default 1000 lines) */
   scrollbackCapacity?: number;
+  /** Agent profile for chrome filtering */
+  agentProfile?: AgentProfile;
 }
 
 export interface PtyExitInfo {
@@ -34,6 +38,7 @@ export interface PtyExitInfo {
 export class PtySpawn extends EventEmitter {
   private ptyProcess: pty.IPty | null = null;
   private screenBuffer: ScreenBuffer;
+  private contentLog: ContentLog | null = null;
   private recorder: Recorder | null = null;
   private options: Required<Pick<PtySpawnOptions, 'command' | 'args' | 'cwd' | 'cols' | 'rows'>> & PtySpawnOptions;
 
@@ -51,6 +56,12 @@ export class PtySpawn extends EventEmitter {
       rows: this.options.rows,
       scrollbackCapacity: opts.scrollbackCapacity ?? 1000,
     });
+    if (opts.agentProfile) {
+      this.contentLog = new ContentLog({
+        agentProfile: opts.agentProfile,
+        capacity: opts.scrollbackCapacity ?? 1000,
+      });
+    }
     if (opts.record) {
       this.recorder = new Recorder(opts.name ?? 'session');
     }
@@ -75,6 +86,11 @@ export class PtySpawn extends EventEmitter {
       this.emit('data', data);
       this.screenBuffer.write(data);
       this.recorder?.write({ type: 'output', data });
+      // Feed viewport snapshot to ContentLog after ScreenBuffer processes
+      if (this.contentLog) {
+        const viewport = this.screenBuffer.getViewport();
+        this.contentLog.update(viewport);
+      }
     });
 
     this.ptyProcess.onExit(({ exitCode, signal }) => {
@@ -88,6 +104,7 @@ export class PtySpawn extends EventEmitter {
   write(data: string): void {
     this.ptyProcess?.write(data);
     this.recorder?.write({ type: 'input', data });
+    this.contentLog?.logInput(data);
   }
 
   /** Resize PTY */
@@ -110,11 +127,15 @@ export class PtySpawn extends EventEmitter {
   restart(): void {
     this.kill();
     this.screenBuffer.clear();
+    this.contentLog?.clear();
     this.spawn();
   }
 
-  /** Get recent log lines — clean text resolved through virtual terminal */
+  /** Get recent log lines — from ContentLog if available, else ScreenBuffer */
   getLines(n?: number): string[] {
+    if (this.contentLog) {
+      return this.contentLog.getLines(n);
+    }
     return this.screenBuffer.getLines(n);
   }
 
