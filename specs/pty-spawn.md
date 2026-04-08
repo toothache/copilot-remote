@@ -1,113 +1,86 @@
-# Spec — PTY Spawn & Passthrough
+# Spec — PtySpawn
 
 ## Responsibility
 
-Spawn the agent CLI inside a pseudo-terminal (node-pty), pass through I/O transparently, and record all output for replay.
+Spawn a process inside a pseudo-terminal (node-pty), expose raw I/O via events, and manage the process lifecycle. **Standalone** — knows nothing about agents, screens, or networking.
 
 ---
 
-## Basic Operation
+## Design Principle
 
-```bash
-copilot-remote copilot --name my-project
-```
+PtySpawn is a thin wrapper around node-pty. It adds:
+1. **Command resolution** on Windows (`.exe` suffix via `where.exe`).
+2. **Simulated typing** for TUI apps that process stdin in raw mode.
+3. **EventEmitter hooks** so consumers attach their own logic externally.
 
-1. Parse CLI args to extract agent command and monitor options.
-2. Spawn agent command in a PTY (node-pty) with inherited environment and cwd.
-3. Pipe `process.stdin` → PTY stdin (transparent passthrough).
-4. Pipe PTY stdout → `process.stdout` (transparent passthrough).
-5. Handle terminal resize (`SIGWINCH` on Unix, ConPTY on Windows).
-6. On PTY exit → emit exit event, clean up, exit with agent's exit code.
-
-The user should not notice any difference from running the agent directly — same colors, same cursor behavior, same interactive experience.
+It does NOT contain: ScreenBuffer, ContentLog, Recorder, AgentProfile, or any agent-specific knowledge. Wiring happens at the application level.
 
 ---
 
-## PTY Configuration
+## API
+
+### Construction & Spawn
 
 ```ts
 interface PtySpawnOptions {
   command: string;         // e.g. "copilot"
-  args: string[];          // e.g. []
-  cwd: string;             // --cwd or process.cwd()
-  env: NodeJS.ProcessEnv;  // inherited + any overrides
-  cols: number;            // process.stdout.columns
-  rows: number;            // process.stdout.rows
+  args?: string[];         // e.g. []
+  name?: string;           // session name for display
+  cwd?: string;            // default process.cwd()
+  env?: NodeJS.ProcessEnv; // default process.env
+  cols?: number;           // default process.stdout.columns
+  rows?: number;           // default process.stdout.rows
+}
+
+class PtySpawn extends EventEmitter {
+  constructor(opts: PtySpawnOptions);
+  spawn(): void;
 }
 ```
 
-- Use `node-pty` for cross-platform PTY (ConPTY on Windows, native on Unix).
-- Inherit `process.env` — agent CLIs need PATH, HOME, etc.
-- Set `stdin` to raw mode for full key passthrough.
-
----
-
-## Output Tapping
-
-PTY stdout is a single stream. Multiple consumers need it:
-
-```
-PTY stdout ──┬──▶ process.stdout     (user sees output)
-             ├──▶ OutputMonitor       (pattern detection — future)
-             ├──▶ RingBuffer          (for //logs command — future)
-             └──▶ Recorder            (write to .jsonl file)
-```
-
-All taps are synchronous listeners on the PTY `onData` event. No buffering or delays — output appears on screen instantly.
-
----
-
-## Ring Buffer
-
-Stores recent output lines for `//logs` command and output digest.
+### Events (hooks)
 
 ```ts
-interface RingBuffer {
-  push(line: string): void;
-  getLines(n?: number): string[];  // last N lines, default all
-  capacity: number;                // max lines stored (default 1000)
-}
+on('data', (data: string) => void)     // raw PTY output chunk
+on('exit', (info: PtyExitInfo) => void) // process exited
 ```
 
-Populated by splitting PTY output on newlines (after ANSI stripping). Available from startup.
+Consumers hook `on('data')` to attach AgentScreen, Recorder, or any other processing. PtySpawn doesn't care what they do with the data.
+
+### Writing to PTY
+
+```ts
+// Raw write — sends bytes directly to PTY stdin
+write(data: string): void;
+
+// Simulated typing for TUI apps (Ink/React raw mode)
+// Writes text as bulk chunk, then \r after delay to submit
+writeSimulated(text: string, submit?: boolean, preSubmitDelay?: number): Promise<void>;
+```
+
+`writeSimulated()` exists because TUI apps like Copilot CLI (built on Ink) process stdin character-by-character in raw mode. Sending `text + '\r'` as one chunk doesn't work — the TUI needs time to process text before receiving Enter.
+
+### Process Control
+
+```ts
+resize(cols: number, rows: number): void;
+kill(): void;
+restart(): Promise<void>;  // kill + respawn with same options
+```
+
+### State
+
+```ts
+get pid(): number | undefined;
+get running(): boolean;
+```
 
 ---
 
-## Recording (for test replay)
+## Windows Compatibility
 
-Every PTY output chunk is written to a `.jsonl` file:
-
-```jsonl
-{"t":0,"type":"spawn","command":"copilot","args":[],"cols":120,"rows":40}
-{"t":12,"type":"output","data":"Welcome to GitHub Copilot CLI..."}
-{"t":1503,"type":"output","data":"Allow write to src/index.ts? (y/n)"}
-{"t":5200,"type":"input","data":"y\n"}
-{"t":5250,"type":"output","data":"✓ Wrote src/index.ts"}
-{"t":18400,"type":"exit","code":0}
-```
-
-- `t` = milliseconds since spawn.
-- `type` = `spawn`, `output`, `input`, `exit`, `resize`.
-- `data` = raw string (with ANSI codes preserved).
-
-**File location:** `~/.copilot-remote/recordings/{name}-{timestamp}.jsonl`
-
-**Opt-in:** `--record` flag enables recording. Off by default.
-
-**Replay mode:** `copilot-remote --replay <file>` feeds recorded output through the pipeline at original timing. No real PTY spawned. Useful for testing OutputMonitor patterns without a live agent.
-
----
-
-## Restart Support
-
-For `//restart` command (future):
-
-1. Kill current PTY process.
-2. Respawn with same `PtySpawnOptions`.
-3. All taps (OutputMonitor, RingBuffer, Recorder) continue on the new PTY.
-4. Ring buffer is cleared on restart (fresh session).
-
-The monitor process itself stays alive — only the inner agent restarts.
+- **Command resolution**: `copilot` → `copilot.exe`. Uses `where.exe` to find the full path. Required because node-pty on Windows needs `.exe` suffix.
+- **ConPTY**: node-pty uses ConPTY on Windows. `writeSimulated()` with delayed `\r` is required for reliable TUI input.
 
 ---
 
@@ -116,23 +89,54 @@ The monitor process itself stays alive — only the inner agent restarts.
 | Signal | Action |
 |--------|--------|
 | `SIGWINCH` | Resize PTY to match new terminal dimensions |
-| `SIGINT` (Ctrl+C) | Forward to PTY (agent handles it). Do NOT exit monitor. |
+| `SIGINT` (Ctrl+C) | Forward to PTY. Do NOT exit wrapper. |
 | `SIGTERM` | Kill PTY, clean up, exit. |
 
 On Windows, `SIGWINCH` is handled via `process.stdout.on('resize')`.
 
 ---
 
-## Exit Behavior
+## Wiring Example
 
-- When agent process exits → monitor exits with same exit code.
-- Clean up: restore terminal raw mode, flush recorder, close files.
-- Print summary line: `[copilot-remote] Agent exited (code: 0)`.
+```ts
+// Application level — wire PtySpawn to AgentScreen
+const pty = new PtySpawn({ command: 'copilot' });
+const screen = new CopilotScreen();
+
+pty.on('data', (data) => {
+  process.stdout.write(data);   // passthrough to terminal
+  screen.write(data);           // feed to screen parser
+});
+
+pty.on('exit', (info) => {
+  screen.dispose();
+  process.exit(info.exitCode);
+});
+
+pty.spawn();
+```
+
+---
+
+## Testing
+
+Testable with simple commands — no agent or screen needed:
+
+```ts
+const pty = new PtySpawn({ command: 'echo', args: ['hello'] });
+const chunks: string[] = [];
+pty.on('data', (d) => chunks.push(d));
+pty.on('exit', (info) => {
+  assert(chunks.join('').includes('hello'));
+  assert(info.exitCode === 0);
+});
+pty.spawn();
+```
 
 ---
 
 ## Open Questions
 
-- [ ] Should `--record` be on by default during prototype phase?
-- [ ] Max recording file size / auto-rotation?
-- [ ] Support passing agent command as a single quoted string? e.g. `copilot-remote "claude --continue"`
+- [ ] Should `restart()` emit a `restart` event?
+- [ ] Should `--record` be a PtySpawn concern or an external hook? (Current preference: external hook via `on('data')`)
+- [ ] `writeSimulated` delay (50ms) — needs tuning per platform?
