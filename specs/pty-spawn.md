@@ -49,6 +49,10 @@ class PtySpawn extends EventEmitter {
 ### Input
 
 ```ts
+// Raw write — forwards bytes directly to the PTY fd.
+// Used for local stdin passthrough (every keystroke as-is, no delay, no \r).
+writeRaw(data: string): void;
+
 // Send text input to agent — simulated typing + submit
 // Writes text as bulk chunk, then \r after delay so TUI processes it
 sendText(text: string): Promise<void>;
@@ -57,9 +61,10 @@ sendText(text: string): Promise<void>;
 sendKey(key: 'ctrl-c' | 'escape'): void;
 ```
 
-`sendText()` exists because TUI apps like Copilot CLI (built on Ink) process stdin character-by-character in raw mode. Sending `text + '\r'` as one chunk doesn't work — the TUI needs time to process text before receiving Enter.
-
-No raw `write()` is exposed. Consumers don't need to know about PTY byte sequences.
+Three input methods for three use cases:
+- **`writeRaw`** — local passthrough. stdin in raw mode delivers every keystroke; `writeRaw` forwards it to the PTY unmodified. Enter key arrives as `\r` naturally.
+- **`sendText`** — remote/command mode. Text arrives as a whole string. Writes the text, waits 50ms for TUI to process, then sends `\r`. Needed because TUI apps (Ink/React raw mode) choke on `text + '\r'` as one chunk.
+- **`sendKey`** — control keys like Ctrl+C, Escape. Writes the corresponding control byte.
 
 ### Events
 

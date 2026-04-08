@@ -106,6 +106,11 @@ export class PtySpawn extends EventEmitter {
     this.ptyProcess.write('\r');
   }
 
+  /** Write raw data directly to the PTY — for local stdin passthrough. */
+  writeRaw(data: string): void {
+    this.ptyProcess?.write(data);
+  }
+
   /** Send a control/special key */
   sendKey(key: SpecialKey): void {
     this.ptyProcess?.write(KEY_MAP[key]);

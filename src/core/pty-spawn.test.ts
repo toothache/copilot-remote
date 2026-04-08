@@ -164,6 +164,35 @@ describe('PtySpawn', () => {
     });
   });
 
+  describe('writeRaw', () => {
+    it('forwards raw bytes to the PTY without delay or \\r', async () => {
+      const pty = create({ command: 'cmd.exe', args: ['/k', 'echo ready'] });
+
+      let output = '';
+      pty.on('data', (data: string) => { output += data; });
+      pty.spawn();
+
+      await new Promise(r => setTimeout(r, 500));
+
+      // Write characters one by one, then \r — exactly like raw stdin passthrough
+      for (const ch of 'echo hello_raw') {
+        pty.writeRaw(ch);
+      }
+      pty.writeRaw('\r');
+
+      await new Promise(r => setTimeout(r, 500));
+
+      expect(output).toContain('hello_raw');
+
+      pty.kill();
+    });
+
+    it('is a no-op before spawn', () => {
+      const pty = create({ command: 'echo' });
+      expect(() => pty.writeRaw('test')).not.toThrow();
+    });
+  });
+
   describe('sendKey', () => {
     it('sends ctrl-c to a running process', async () => {
       const cmd = isWin ? 'cmd.exe' : '/bin/cat';
