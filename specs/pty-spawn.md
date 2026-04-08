@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-Spawn a process inside a pseudo-terminal (node-pty), expose raw I/O via events, and manage the process lifecycle. **Standalone** — knows nothing about agents, screens, or networking.
+Spawn a process inside a pseudo-terminal (node-pty), expose raw output via events, and accept input. **Standalone** — knows nothing about agents, screens, or networking.
 
 ---
 
@@ -19,7 +19,7 @@ It does NOT contain: ScreenBuffer, ContentLog, Recorder, AgentProfile, or any ag
 
 ## API
 
-### Construction & Spawn
+### Construction & Lifecycle
 
 ```ts
 interface PtySpawnOptions {
@@ -28,45 +28,47 @@ interface PtySpawnOptions {
   name?: string;           // session name for display
   cwd?: string;            // default process.cwd()
   env?: NodeJS.ProcessEnv; // default process.env
-  cols?: number;           // default process.stdout.columns
-  rows?: number;           // default process.stdout.rows
+  cols?: number;           // default 80
+  rows?: number;           // default 24
+}
+
+interface PtyExitInfo {
+  exitCode: number;
+  signal?: number;
 }
 
 class PtySpawn extends EventEmitter {
   constructor(opts: PtySpawnOptions);
-  spawn(): void;
+
+  spawn(): void;       // start the PTY process
+  kill(): void;        // kill the PTY process
+  restart(): void;     // kill + respawn with same options
 }
 ```
 
-### Events (hooks)
+### Input
 
 ```ts
-on('data', (data: string) => void)     // raw PTY output chunk
-on('exit', (info: PtyExitInfo) => void) // process exited
+// Send text input to agent — simulated typing + submit
+// Writes text as bulk chunk, then \r after delay so TUI processes it
+sendText(text: string): Promise<void>;
+
+// Send a control/special key
+sendKey(key: 'ctrl-c' | 'escape'): void;
+```
+
+`sendText()` exists because TUI apps like Copilot CLI (built on Ink) process stdin character-by-character in raw mode. Sending `text + '\r'` as one chunk doesn't work — the TUI needs time to process text before receiving Enter.
+
+No raw `write()` is exposed. Consumers don't need to know about PTY byte sequences.
+
+### Events
+
+```ts
+on(event: 'data', cb: (data: string) => void): this;   // raw PTY output chunk
+on(event: 'exit', cb: (info: PtyExitInfo) => void): this; // process exited
 ```
 
 Consumers hook `on('data')` to attach AgentScreen, Recorder, or any other processing. PtySpawn doesn't care what they do with the data.
-
-### Writing to PTY
-
-```ts
-// Raw write — sends bytes directly to PTY stdin
-write(data: string): void;
-
-// Simulated typing for TUI apps (Ink/React raw mode)
-// Writes text as bulk chunk, then \r after delay to submit
-writeSimulated(text: string, submit?: boolean, preSubmitDelay?: number): Promise<void>;
-```
-
-`writeSimulated()` exists because TUI apps like Copilot CLI (built on Ink) process stdin character-by-character in raw mode. Sending `text + '\r'` as one chunk doesn't work — the TUI needs time to process text before receiving Enter.
-
-### Process Control
-
-```ts
-resize(cols: number, rows: number): void;
-kill(): void;
-restart(): Promise<void>;  // kill + respawn with same options
-```
 
 ### State
 
@@ -80,19 +82,7 @@ get running(): boolean;
 ## Windows Compatibility
 
 - **Command resolution**: `copilot` → `copilot.exe`. Uses `where.exe` to find the full path. Required because node-pty on Windows needs `.exe` suffix.
-- **ConPTY**: node-pty uses ConPTY on Windows. `writeSimulated()` with delayed `\r` is required for reliable TUI input.
-
----
-
-## Signal Handling
-
-| Signal | Action |
-|--------|--------|
-| `SIGWINCH` | Resize PTY to match new terminal dimensions |
-| `SIGINT` (Ctrl+C) | Forward to PTY. Do NOT exit wrapper. |
-| `SIGTERM` | Kill PTY, clean up, exit. |
-
-On Windows, `SIGWINCH` is handled via `process.stdout.on('resize')`.
+- **ConPTY**: node-pty uses ConPTY on Windows. `sendText()` with delayed `\r` is required for reliable TUI input.
 
 ---
 
@@ -138,5 +128,4 @@ pty.spawn();
 ## Open Questions
 
 - [ ] Should `restart()` emit a `restart` event?
-- [ ] Should `--record` be a PtySpawn concern or an external hook? (Current preference: external hook via `on('data')`)
-- [ ] `writeSimulated` delay (50ms) — needs tuning per platform?
+- [ ] `sendText` delay (50ms) — needs tuning per platform?

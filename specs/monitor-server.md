@@ -66,8 +66,8 @@ When a request can't be fulfilled:
 | `get_viewport` | `screen.getViewport()` | — |
 | `get_logs` | `screen.getLog(n)` | — |
 | `get_info` | `screen.logSize` + internal state | — |
-| `send_input` | — | `pty.writeSimulated(data)` |
-| `send_ctrl_c` | — | `pty.write('\x03')` |
+| `send_input` | — | `pty.sendText(data)` |
+| `send_ctrl_c` | — | `pty.sendKey('ctrl-c')` |
 
 This is why MonitorServer needs both `pty` and `screen` — reads go to screen, writes go to PTY.
 

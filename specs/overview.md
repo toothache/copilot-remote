@@ -28,8 +28,8 @@ Two layers. Core is a reusable library. Application wires core pieces for the sp
 
 ```
 PtySpawn                    AgentScreen (base)
-  │ spawn, write, kill        │ ANSI → clean text, viewport, log
-  │ events: data, exit        │
+  │ spawn, sendText, kill     │ ANSI → clean text, viewport, log
+  │ sendKey, events           │
   │                           CopilotScreen (subclass)
   │                             │ chrome filter, settle dedup,
   │                             │ prompt/error detection
