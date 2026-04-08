@@ -100,11 +100,26 @@ export class PtySpawn extends EventEmitter {
     });
   }
 
-  /** Write data to PTY stdin */
+  /** Write data to PTY stdin (raw) */
   write(data: string): void {
     this.ptyProcess?.write(data);
     this.recorder?.write({ type: 'input', data });
     this.contentLog?.logInput(data);
+  }
+
+  /**
+   * Simulate typing + submit for TUI apps (Ink/React) that process
+   * stdin in raw mode. Writes text as a block, then sends \r after
+   * a short delay so the TUI can process the input before submit.
+   */
+  async writeSimulated(text: string, submit = true, preSubmitDelay = 50): Promise<void> {
+    this.ptyProcess?.write(text);
+    if (submit) {
+      await new Promise(r => setTimeout(r, preSubmitDelay));
+      this.ptyProcess?.write('\r');
+    }
+    this.recorder?.write({ type: 'input', data: text + (submit ? '\r' : '') });
+    this.contentLog?.logInput(text);
   }
 
   /** Resize PTY */

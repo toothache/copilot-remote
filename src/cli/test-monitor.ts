@@ -207,7 +207,7 @@ function handleCommand(line: string): void {
       if (!text) {
         console.log(`${RED}Usage: //send <text>${RESET}`);
       } else {
-        request({ type: 'send_input', data: text + '\n' });
+        request({ type: 'send_input', data: text });
       }
       break;
     }

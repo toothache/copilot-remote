@@ -156,8 +156,9 @@ export class MonitorServer {
       }
       case 'send_input': {
         if (msg.data && this.state === 'running') {
-          this.ptySpawn.write(msg.data);
-          this.send(socket, { type: 'ok', action: 'input_sent' });
+          this.ptySpawn.writeSimulated(msg.data).then(() => {
+            this.send(socket, { type: 'ok', action: 'input_sent' });
+          });
         }
         break;
       }
