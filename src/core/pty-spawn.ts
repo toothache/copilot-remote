@@ -1,33 +1,23 @@
 /**
- * PtySpawn — core component for spawning and managing an agent CLI in a PTY.
+ * PtySpawn — standalone PTY wrapper.
  *
- * Provides transparent passthrough, output tapping (multiple consumers),
- * virtual terminal screen buffer (via @xterm/headless), and optional recording.
+ * Spawns a process inside a pseudo-terminal (node-pty), exposes raw output
+ * via events, and accepts input via sendText/sendKey. Knows nothing about
+ * agents, screens, or networking.
  */
 
 import * as pty from 'node-pty';
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
-import { ScreenBuffer } from './screen-buffer.js';
-import { ContentLog } from './content-log.js';
-import { Recorder } from './recorder.js';
-import type { AgentProfile } from './agent-profile.js';
 
 export interface PtySpawnOptions {
   command: string;
   args?: string[];
+  name?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   cols?: number;
   rows?: number;
-  /** Enable .jsonl recording */
-  record?: boolean;
-  /** Session name (used for recording filename and display) */
-  name?: string;
-  /** Ring buffer capacity (default 1000 lines) */
-  scrollbackCapacity?: number;
-  /** Agent profile for chrome filtering */
-  agentProfile?: AgentProfile;
 }
 
 export interface PtyExitInfo {
@@ -35,42 +25,35 @@ export interface PtyExitInfo {
   signal?: number;
 }
 
+/** Supported special keys for sendKey() */
+export type SpecialKey = 'ctrl-c' | 'escape';
+
+const KEY_MAP: Record<SpecialKey, string> = {
+  'ctrl-c': '\x03',
+  'escape': '\x1b',
+};
+
 export class PtySpawn extends EventEmitter {
   private ptyProcess: pty.IPty | null = null;
-  private screenBuffer: ScreenBuffer;
-  private contentLog: ContentLog | null = null;
-  private recorder: Recorder | null = null;
-  private options: Required<Pick<PtySpawnOptions, 'command' | 'args' | 'cwd' | 'cols' | 'rows'>> & PtySpawnOptions;
+  private _running = false;
+  private opts: Required<Pick<PtySpawnOptions, 'command' | 'args' | 'cwd' | 'cols' | 'rows'>> & PtySpawnOptions;
 
   constructor(opts: PtySpawnOptions) {
     super();
-    this.options = {
+    this.opts = {
       ...opts,
       args: opts.args ?? [],
       cwd: opts.cwd ?? process.cwd(),
-      cols: opts.cols ?? process.stdout.columns ?? 80,
-      rows: opts.rows ?? process.stdout.rows ?? 24,
+      cols: opts.cols ?? 80,
+      rows: opts.rows ?? 24,
     };
-    this.screenBuffer = new ScreenBuffer({
-      cols: this.options.cols,
-      rows: this.options.rows,
-      scrollbackCapacity: opts.scrollbackCapacity ?? 1000,
-    });
-    if (opts.agentProfile) {
-      this.contentLog = new ContentLog({
-        agentProfile: opts.agentProfile,
-        capacity: opts.scrollbackCapacity ?? 1000,
-      });
-    }
-    if (opts.record) {
-      this.recorder = new Recorder(opts.name ?? 'session');
-    }
   }
 
+  /** Start the PTY process */
   spawn(): void {
-    const { args, cwd, cols, rows } = this.options;
-    const command = resolveCommand(this.options.command);
-    const env = this.options.env ?? { ...process.env } as Record<string, string>;
+    const { args, cwd, cols, rows } = this.opts;
+    const command = resolveCommand(this.opts.command);
+    const env = this.opts.env ?? { ...process.env } as Record<string, string>;
 
     this.ptyProcess = pty.spawn(command, args, {
       name: 'xterm-256color',
@@ -80,53 +63,20 @@ export class PtySpawn extends EventEmitter {
       env: env as Record<string, string>,
     });
 
-    this.recorder?.write({ type: 'spawn', command, args, cols, rows });
+    this._running = true;
+
+    const currentProcess = this.ptyProcess;
 
     this.ptyProcess.onData((data: string) => {
       this.emit('data', data);
-      this.screenBuffer.write(data);
-      this.recorder?.write({ type: 'output', data });
-      // Feed viewport snapshot to ContentLog after ScreenBuffer processes
-      if (this.contentLog) {
-        const viewport = this.screenBuffer.getViewport();
-        this.contentLog.update(viewport);
-      }
     });
 
     this.ptyProcess.onExit(({ exitCode, signal }) => {
-      const info: PtyExitInfo = { exitCode, signal };
-      this.recorder?.write({ type: 'exit', code: exitCode });
-      this.emit('exit', info);
+      // Ignore exit from a previous process after restart
+      if (this.ptyProcess !== currentProcess) return;
+      this._running = false;
+      this.emit('exit', { exitCode, signal } as PtyExitInfo);
     });
-  }
-
-  /** Write data to PTY stdin (raw) */
-  write(data: string): void {
-    this.ptyProcess?.write(data);
-    this.recorder?.write({ type: 'input', data });
-    this.contentLog?.logInput(data);
-  }
-
-  /**
-   * Simulate typing + submit for TUI apps (Ink/React) that process
-   * stdin in raw mode. Writes text as a block, then sends \r after
-   * a short delay so the TUI can process the input before submit.
-   */
-  async writeSimulated(text: string, submit = true, preSubmitDelay = 50): Promise<void> {
-    this.ptyProcess?.write(text);
-    if (submit) {
-      await new Promise(r => setTimeout(r, preSubmitDelay));
-      this.ptyProcess?.write('\r');
-    }
-    this.recorder?.write({ type: 'input', data: text + (submit ? '\r' : '') });
-    this.contentLog?.logInput(text);
-  }
-
-  /** Resize PTY */
-  resize(cols: number, rows: number): void {
-    this.ptyProcess?.resize(cols, rows);
-    this.screenBuffer.resize(cols, rows);
-    this.recorder?.write({ type: 'resize', cols, rows });
   }
 
   /** Kill the PTY process */
@@ -138,45 +88,42 @@ export class PtySpawn extends EventEmitter {
     }
   }
 
-  /** Respawn with same options (for //restart) */
+  /** Kill and respawn with same options */
   restart(): void {
     this.kill();
-    this.screenBuffer.clear();
-    this.contentLog?.clear();
     this.spawn();
   }
 
-  /** Get recent log lines — from ContentLog if available, else ScreenBuffer */
-  getLines(n?: number): string[] {
-    if (this.contentLog) {
-      return this.contentLog.getLines(n);
-    }
-    return this.screenBuffer.getLines(n);
+  /**
+   * Send text input to the agent. Writes text as a bulk chunk, then sends
+   * \r after a short delay so TUI apps (Ink/React raw mode) can process
+   * the characters before receiving Enter.
+   */
+  async sendText(text: string, preSubmitDelay = 50): Promise<void> {
+    if (!this.ptyProcess) return;
+    this.ptyProcess.write(text);
+    await new Promise(r => setTimeout(r, preSubmitDelay));
+    this.ptyProcess.write('\r');
   }
 
-  /** Get current viewport content — what the user sees on screen right now */
-  getViewport(): string[] {
-    return this.screenBuffer.getViewport();
-  }
-
-  /** Get viewport as a single string — convenient for regex matching */
-  getViewportText(): string {
-    return this.screenBuffer.getViewportText();
-  }
-
-  get recordingPath(): string | null {
-    return this.recorder?.path ?? null;
+  /** Send a control/special key */
+  sendKey(key: SpecialKey): void {
+    this.ptyProcess?.write(KEY_MAP[key]);
   }
 
   get pid(): number | undefined {
     return this.ptyProcess?.pid;
+  }
+
+  get running(): boolean {
+    return this._running;
   }
 }
 
 /** Resolve a command name to its full path on Windows (node-pty needs .exe). */
 function resolveCommand(command: string): string {
   if (process.platform !== 'win32') return command;
-  if (/\.\w+$/.test(command)) return command; // already has extension
+  if (/\.\w+$/.test(command)) return command;
 
   try {
     const resolved = execFileSync('where.exe', [command], {
