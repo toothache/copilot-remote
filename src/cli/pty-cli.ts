@@ -109,11 +109,13 @@ function restoreCursor(): string { return `${ESC}8`; }
 // --- Overlay rendering (command mode only) ---
 
 function showOverlay(): void {
+  // "[CMD] > " = 8 visible chars, columns are 1-based
+  const cursorCol = 9 + inputBuffer.length;
   process.stdout.write(
     saveCursor() +
     moveTo(totalRows, 1) + CLEAR_LINE +
     `${YELLOW}${BOLD}[CMD]${RESET} ${CYAN}> ${RESET}${inputBuffer}` +
-    moveTo(totalRows, 8 + inputBuffer.length) + SHOW_CURSOR
+    moveTo(totalRows, cursorCol) + SHOW_CURSOR
   );
 }
 
