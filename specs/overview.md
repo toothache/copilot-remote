@@ -26,37 +26,53 @@ Two layers. Core is a reusable library. Application wires core pieces for the sp
 
 ### Core (library — no networking, no UI)
 
+**Dual data path**: PTY layer for live visual state, Events layer for structured content.
+
 ```
-PtySpawn                    AgentScreen (base)
-  │ spawn, sendText, kill     │ ANSI → clean text, viewport, log
-  │ sendKey, events           │
-  │                           CopilotScreen (subclass)
-  │                             │ chrome filter, settle dedup,
-  │                             │ prompt/error detection
-  └─── on('data') ───────────▶ │
+PtySpawn                    AgentScreen (base)         SessionDiscovery
+  │ spawn, sendText, kill     │ ANSI → viewport/log      │ PID → session folder
+  │ sendKey, writeRaw         │                           │
+  │                           CopilotScreen (subclass)  EventsReader
+  │                             │ chrome filter, dedup     │ tail events.jsonl
+  └─── on('data') ───────────▶ │                          │ structured events
+                                                          │ messages, tools,
+                                                          │ permissions, lifecycle
 ```
 
 **PtySpawn** — Generic PTY wrapper. Spawns a process, exposes raw I/O hooks. Knows nothing about agents.
 
-**AgentScreen** — Virtual terminal that resolves ANSI escape sequences into clean text. Provides viewport (current screen) and log (meaningful output history). Base class is agent-agnostic.
+**AgentScreen** — Virtual terminal (xterm-headless) resolving ANSI into clean text. Snapshot-based viewport + tail-overlap log. Visual camera.
 
-**CopilotScreen** — Subclass of AgentScreen with Copilot CLI knowledge: chrome patterns (box borders, spinners, status bar), settle-based dedup, prompt/error regex patterns.
+**CopilotScreen** — AgentScreen subclass with Copilot CLI knowledge: chrome patterns, normalization, region classification.
+
+**SessionDiscovery** — Finds Copilot CLI's session folder by walking the process tree from PtySpawn's PID to the child copilot.exe PID, then matching `inuse.{PID}.lock` in `~/.copilot/session-state/`.
+
+**EventsReader** — Tails `events.jsonl` from the discovered session folder. Emits typed events: user messages, assistant responses, tool calls, permission requests, session lifecycle. Lossless transcript.
 
 ### Application (wiring, networking, UI)
 
-- **MonitorServer** — TCP server for remote access. Takes `{ pty: PtySpawn, screen: AgentScreen }`.
-- **CLI entry point** — Creates PtySpawn + CopilotScreen, hooks them together, starts MonitorServer.
+- **MonitorServer** — TCP server for remote access. Takes `{ pty, screen, events }`.
+- **CLI entry point** — Creates PtySpawn + CopilotScreen + EventsReader, wires them together.
 - **HudRenderer, InputRouter, WeChatBridge** — future application-level components.
 
 ### Data Flow
 
 ```
-PtySpawn ──on('data')──▶ CopilotScreen ──▶ viewport / log
-    │                                           │
-    │                                           ▼
-    └─────────────── MonitorServer (reads screen, writes pty)
-                           │
-                      [Remote Client]
+                        ┌──────────────────┐
+PtySpawn ─on('data')──▶ │  CopilotScreen   │──▶ viewport (live visual)
+  │                     │  (xterm-headless) │──▶ content log (visual)
+  │                     └──────────────────┘
+  │
+  │  (same copilot.exe process)
+  │
+  │                     ┌──────────────────┐
+  └─ PID ──▶ Discovery ▶│  EventsReader    │──▶ messages, tool calls
+             (lock file) │  (events.jsonl)  │──▶ permission requests
+                         └──────────────────┘──▶ session lifecycle
+                                │
+                  WeChat Bridge consumes both:
+                  ├─ EventsReader → rich notifications
+                  └─ AgentScreen  → viewport on demand
 ```
 
 ---
